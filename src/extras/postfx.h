@@ -20,6 +20,14 @@ public:
 	static bool MotionBlurOn;	// or use CMblur for that?
 	static float Intensity;
 
+	// Bloom effect
+	static RwRaster *pBloomBuffer;
+	static RwRaster *pBloomTempBuffer;
+	static RwTexture *pBloomTex;  // Texture wrapper for second texture unit
+	static bool BloomEnable;
+	static float BloomThreshold;
+	static float BloomIntensity;
+
 	// smooth blur color
 	enum { NUMAVERAGE = 20 };
 	static int PrevRed[NUMAVERAGE], AvgRed;
@@ -36,6 +44,7 @@ public:
 	static void RenderOverlaySniper(RwCamera *cam, int32 r, int32 g, int32 b, int32 a);
 	static void RenderOverlayShader(RwCamera *cam, int32 r, int32 g, int32 b, int32 a);
 	static void RenderMotionBlur(RwCamera *cam, uint32 blur);
+	static void RenderBloom(RwCamera *cam);
 	static void Render(RwCamera *cam, uint32 red, uint32 green, uint32 blue, uint32 blur, int32 type, uint32 bluralpha);
 	static void SmoothColor(uint32 red, uint32 green, uint32 blue, uint32 alpha);
 	static bool NeedBackBuffer(void);
