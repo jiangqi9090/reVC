@@ -27,6 +27,8 @@ long _dwOperatingSystemVersion;
 #endif
 
 #include "common.h"
+#include <algorithm>
+
 #if (defined(_MSC_VER))
 #include <tchar.h>
 #endif /* (defined(_MSC_VER)) */
@@ -2500,7 +2502,12 @@ void CapturePad(RwInt32 padID)
 		ControlsManager.m_NewState.mappedButtons[15] = ControlsManager.m_NewState.mappedButtons[16] = 0;
 	}
 
-	ControlsManager.m_NewState.buttons = (uint8*)buttons;
+	// Copy joystick buttons
+	if (buttons && numButtons > 0) {
+		int copyCount = std::min(numButtons, (int)MAX_BUTTONS);
+		memcpy(ControlsManager.m_NewState.buttons, buttons, copyCount);
+	}
+	
 	ControlsManager.m_NewState.numButtons = numButtons;
 	ControlsManager.m_NewState.id = glfwPad;
 	ControlsManager.m_NewState.isGamepad = glfwGetGamepadState(glfwPad, &gamepadState);
