@@ -17,6 +17,7 @@
 #include "Draw.h"
 #include "Sprite2d.h"
 #include "Renderer.h"
+#include "Bloom.h"
 #include "Coronas.h"
 #include "WaterLevel.h"
 #include "Weather.h"
@@ -362,6 +363,7 @@ DoRWStuffEndOfFrame(void)
 	CDebug::DebugDisplayTextBuffer();
 	FlushObrsPrintfs();
 	RwCameraEndUpdate(Scene.camera);
+	CBloom::Render(Scene.camera);
 	RsCameraShowRaster(Scene.camera);
 #ifndef MASTER
 	char s[48];
