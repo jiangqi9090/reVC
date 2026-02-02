@@ -21,8 +21,8 @@ public:
 	
 	static bool Initialise(void);
 	static void Shutdown(void);
-	
 	static void Render(RwCamera *cam);
+	
 	static void SetIntensity(float intensity) { m_fBloomIntensity = intensity; }
 	static void SetThreshold(float threshold) { m_fBloomThreshold = threshold; }
 	static void SetSoftness(float softness) { m_fBloomSoftness = softness; }
@@ -34,10 +34,6 @@ private:
 	static RwRaster *pBrightPass;
 	static RwRaster *pBlurBuffer1;
 	static RwRaster *pBlurBuffer2;
-	
-	static void RenderBrightPass(RwCamera *cam, RwRaster *sceneRaster);
-	static void RenderBlur(RwRaster *src, RwRaster *dst, bool horizontal);
-	static void Composite(RwCamera *cam, RwRaster *sceneRaster);
 };
 
 #endif // __GTA_BLOOM_H__
