@@ -2,7 +2,6 @@
 #define __GTA_BLOOM_H__
 
 #include "common.h"
-#include <rw.h>
 
 class CBloom
 {
