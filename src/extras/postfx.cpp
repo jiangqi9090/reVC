@@ -16,6 +16,11 @@
 #include "MBlur.h"
 #include "postfx.h"
 
+#ifdef RW_OPENGL
+// Include librw GL implementation header for im2DVbo/im2DIbo access
+#include "src/gl/rwgl3impl.h"
+#endif
+
 RwRaster *CPostFX::pFrontBuffer;
 RwRaster *CPostFX::pBackBuffer;
 bool CPostFX::bJustInitialised;
@@ -28,8 +33,28 @@ RwRaster *CPostFX::pBloomBuffer;
 RwRaster *CPostFX::pBloomTempBuffer;
 RwTexture *CPostFX::pBloomTex;
 bool CPostFX::BloomEnable = true;
-float CPostFX::BloomThreshold = 0.6f;
-float CPostFX::BloomIntensity = 1.5f;
+float CPostFX::BloomThreshold = 0.5f;   // Lower = more glow
+float CPostFX::BloomIntensity = 0.6f;   // Bloom strength
+
+// SSAO effect
+RwRaster *CPostFX::pSSAOBuffer;
+RwRaster *CPostFX::pSSAOBlurBuffer;
+RwRaster *CPostFX::pDepthBuffer;
+RwTexture *CPostFX::pSSAOTex;
+RwTexture *CPostFX::pDepthTex;
+bool CPostFX::SSAOEnable = true;
+float CPostFX::SSAORadius = 1.2f;      // Slightly larger radius
+float CPostFX::SSAOBias = 0.025f;
+float CPostFX::SSAOIntensity = 0.7f;   // Slightly higher intensity
+
+#ifdef RW_OPENGL
+// Custom float texture for depth (higher precision than RGBA8)
+// Only depth needs high precision - SSAO result (0-1) is fine with 8-bit
+static GLuint depthFloatTex = 0;
+static GLuint depthFloatFbo = 0;
+static uint32 depthFloatWidth = 0;
+static uint32 depthFloatHeight = 0;
+#endif
 
 static RwIm2DVertex Vertex[4];
 static RwIm2DVertex Vertex2[4];
@@ -50,11 +75,21 @@ int32 u_threshold;
 int32 u_texelSize;
 int32 u_horizontal;
 int32 u_bloomIntensity;
+int32 u_ssaoRadius;
+int32 u_ssaoBias;
+int32 u_ssaoIntensity;
+int32 u_nearPlane;
+int32 u_farPlane;
+int32 u_xform;
 rw::gl3::Shader *colourFilterVC;
 rw::gl3::Shader *contrast;
 rw::gl3::Shader *bloomExtract;
 rw::gl3::Shader *bloomBlur;
 rw::gl3::Shader *bloomComposite;
+rw::gl3::Shader *ssaoCalc;
+rw::gl3::Shader *ssaoBlur;
+rw::gl3::Shader *ssaoApply;
+rw::gl3::Shader *depthCopy;
 #endif
 
 void
@@ -68,6 +103,12 @@ CPostFX::InitOnce(void)
 	u_texelSize = rw::gl3::registerUniform("u_texelSize");
 	u_horizontal = rw::gl3::registerUniform("u_horizontal");
 	u_bloomIntensity = rw::gl3::registerUniform("u_bloomIntensity");
+	u_ssaoRadius = rw::gl3::registerUniform("u_ssaoRadius");
+	u_ssaoBias = rw::gl3::registerUniform("u_ssaoBias");
+	u_ssaoIntensity = rw::gl3::registerUniform("u_ssaoIntensity");
+	u_nearPlane = rw::gl3::registerUniform("u_nearPlane");
+	u_farPlane = rw::gl3::registerUniform("u_farPlane");
+	u_xform = rw::gl3::registerUniform("u_xform", rw::gl3::UNIFORM_VEC4);  // Already registered by librw, safe to call again
 #endif
 }
 
@@ -178,6 +219,46 @@ CPostFX::Open(RwCamera *cam)
 	pBloomTex = RwTextureCreate(nil);
 	RwTextureSetFilterMode(pBloomTex, rwFILTERLINEAR);
 
+	// Create SSAO buffers (half resolution for performance)
+	uint32 ssaoWidth = width / 2;
+	uint32 ssaoHeight = height / 2;
+	pSSAOBuffer = RwRasterCreate(ssaoWidth, ssaoHeight, depth, rwRASTERTYPECAMERATEXTURE);
+	pSSAOBlurBuffer = RwRasterCreate(ssaoWidth, ssaoHeight, depth, rwRASTERTYPECAMERATEXTURE);
+	pSSAOTex = RwTextureCreate(nil);
+	RwTextureSetFilterMode(pSSAOTex, rwFILTERLINEAR);
+
+#ifdef RW_OPENGL
+	// Create high-precision float texture for depth (R32F)
+	// This avoids the banding artifacts from 8-bit RGBA textures
+	depthFloatWidth = width;
+	depthFloatHeight = height;
+	
+	glGenTextures(1, &depthFloatTex);
+	glBindTexture(GL_TEXTURE_2D, depthFloatTex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, depthFloatWidth, depthFloatHeight, 0, GL_RED, GL_FLOAT, nil);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	
+	glGenFramebuffers(1, &depthFloatFbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, depthFloatFbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, depthFloatTex, 0);
+	
+	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if(status != GL_FRAMEBUFFER_COMPLETE) {
+		debug("SSAO: Float depth FBO incomplete, status = 0x%x\n", status);
+	}
+	
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+#endif
+
+	// Keep pDepthBuffer for compatibility but we won't use it for SSAO
+	pDepthBuffer = RwRasterCreate(width, height, depth, rwRASTERTYPECAMERATEXTURE);
+	pDepthTex = RwTextureCreate(nil);
+	RwTextureSetFilterMode(pDepthTex, rwFILTERLINEAR);
+
 #ifdef RW_D3D9
 #include "shaders/obj/colourfilterVC_PS.inc"
 	colourfilterVC_PS = rw::d3d::createPixelShader(colourfilterVC_PS_cso);
@@ -238,6 +319,42 @@ CPostFX::Open(RwCamera *cam)
 	assert(bloomComposite);
 	}
 
+	{
+#include "shaders/obj/im2d_vert.inc"
+#include "shaders/obj/ssao_frag.inc"
+	const char *vs[] = { shaderDecl, header_vert_src, im2d_vert_src, nil };
+	const char *fs[] = { shaderDecl, header_frag_src, ssao_frag_src, nil };
+	ssaoCalc = Shader::create(vs, fs);
+	assert(ssaoCalc);
+	}
+
+	{
+#include "shaders/obj/im2d_vert.inc"
+#include "shaders/obj/ssaoBlur_frag.inc"
+	const char *vs[] = { shaderDecl, header_vert_src, im2d_vert_src, nil };
+	const char *fs[] = { shaderDecl, header_frag_src, ssaoBlur_frag_src, nil };
+	ssaoBlur = Shader::create(vs, fs);
+	assert(ssaoBlur);
+	}
+
+	{
+#include "shaders/obj/im2d_vert.inc"
+#include "shaders/obj/ssaoApply_frag.inc"
+	const char *vs[] = { shaderDecl, header_vert_src, im2d_vert_src, nil };
+	const char *fs[] = { shaderDecl, header_frag_src, ssaoApply_frag_src, nil };
+	ssaoApply = Shader::create(vs, fs);
+	assert(ssaoApply);
+	}
+
+	{
+#include "shaders/obj/im2d_vert.inc"
+#include "shaders/obj/depthCopy_frag.inc"
+	const char *vs[] = { shaderDecl, header_vert_src, im2d_vert_src, nil };
+	const char *fs[] = { shaderDecl, header_frag_src, depthCopy_frag_src, nil };
+	depthCopy = Shader::create(vs, fs);
+	assert(depthCopy);
+	}
+
 #endif
 }
 
@@ -265,6 +382,40 @@ CPostFX::Close(void)
 		RwRasterDestroy(pBloomTempBuffer);
 		pBloomTempBuffer = nil;
 	}
+	if(pSSAOTex){
+		RwTextureSetRaster(pSSAOTex, nil);
+		RwTextureDestroy(pSSAOTex);
+		pSSAOTex = nil;
+	}
+	if(pDepthTex){
+		RwTextureSetRaster(pDepthTex, nil);
+		RwTextureDestroy(pDepthTex);
+		pDepthTex = nil;
+	}
+	if(pSSAOBuffer){
+		RwRasterDestroy(pSSAOBuffer);
+		pSSAOBuffer = nil;
+	}
+	if(pSSAOBlurBuffer){
+		RwRasterDestroy(pSSAOBlurBuffer);
+		pSSAOBlurBuffer = nil;
+	}
+	if(pDepthBuffer){
+		RwRasterDestroy(pDepthBuffer);
+		pDepthBuffer = nil;
+	}
+#ifdef RW_OPENGL
+	if(depthFloatFbo){
+		glDeleteFramebuffers(1, &depthFloatFbo);
+		depthFloatFbo = 0;
+	}
+	if(depthFloatTex){
+		glDeleteTextures(1, &depthFloatTex);
+		depthFloatTex = 0;
+	}
+	depthFloatWidth = 0;
+	depthFloatHeight = 0;
+#endif
 #ifdef RW_D3D9
 	if(colourfilterVC_PS){
 		rw::d3d::destroyPixelShader(colourfilterVC_PS);
@@ -307,6 +458,22 @@ CPostFX::Close(void)
 	if(bloomComposite){
 		bloomComposite->destroy();
 		bloomComposite = nil;
+	}
+	if(ssaoCalc){
+		ssaoCalc->destroy();
+		ssaoCalc = nil;
+	}
+	if(ssaoBlur){
+		ssaoBlur->destroy();
+		ssaoBlur = nil;
+	}
+	if(ssaoApply){
+		ssaoApply->destroy();
+		ssaoApply = nil;
+	}
+	if(depthCopy){
+		depthCopy->destroy();
+		depthCopy = nil;
 	}
 #endif
 }
@@ -524,30 +691,32 @@ CPostFX::RenderBloom(RwCamera *cam)
 
 	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, BloomVertex, 4, Index, 6);
 
-	// Pass 2: Horizontal blur pBloomBuffer -> pBloomTempBuffer
-	bindFramebuffer(bloomTempNatRas->fbo);
-	// frameBuffer still points to pBloomBuffer which has same size as pBloomTempBuffer
+	// Multi-pass blur for better bloom spread (3 iterations)
+	for(int blurPass = 0; blurPass < 3; blurPass++) {
+		// Horizontal blur pBloomBuffer -> pBloomTempBuffer
+		bindFramebuffer(bloomTempNatRas->fbo);
 
-	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, pBloomBuffer);
+		RwRenderStateSet(rwRENDERSTATETEXTURERASTER, pBloomBuffer);
 
-	im2dOverrideShader = bloomBlur;
-	bloomBlur->use();
-	glUniform2f(bloomBlur->uniformLocations[u_texelSize], texelSizeX, texelSizeY);
-	glUniform1f(bloomBlur->uniformLocations[u_horizontal], 1.0f);
+		im2dOverrideShader = bloomBlur;
+		bloomBlur->use();
+		glUniform2f(bloomBlur->uniformLocations[u_texelSize], texelSizeX, texelSizeY);
+		glUniform1f(bloomBlur->uniformLocations[u_horizontal], 1.0f);
 
-	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, BloomVertex, 4, Index, 6);
+		RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, BloomVertex, 4, Index, 6);
 
-	// Pass 3: Vertical blur pBloomTempBuffer -> pBloomBuffer
-	bindFramebuffer(bloomNatRas->fbo);
+		// Vertical blur pBloomTempBuffer -> pBloomBuffer
+		bindFramebuffer(bloomNatRas->fbo);
 
-	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, pBloomTempBuffer);
+		RwRenderStateSet(rwRENDERSTATETEXTURERASTER, pBloomTempBuffer);
 
-	im2dOverrideShader = bloomBlur;
-	bloomBlur->use();
-	glUniform2f(bloomBlur->uniformLocations[u_texelSize], texelSizeX, texelSizeY);
-	glUniform1f(bloomBlur->uniformLocations[u_horizontal], 0.0f);
+		im2dOverrideShader = bloomBlur;
+		bloomBlur->use();
+		glUniform2f(bloomBlur->uniformLocations[u_texelSize], texelSizeX, texelSizeY);
+		glUniform1f(bloomBlur->uniformLocations[u_horizontal], 0.0f);
 
-	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, BloomVertex, 4, Index, 6);
+		RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, BloomVertex, 4, Index, 6);
+	}
 
 	// Restore original camera frameBuffer
 	cam->frameBuffer = origFrameBuffer;
@@ -575,11 +744,307 @@ CPostFX::RenderBloom(RwCamera *cam)
 	POP_RENDERGROUP();
 }
 
+static RwIm2DVertex SSAOVertex[4];
+static RwIm2DVertex DepthCopyVertex[4];
+
+void
+CPostFX::RenderSSAO(RwCamera *cam)
+{
+	if(!SSAOEnable || !pSSAOBuffer)
+		return;
+
+#ifdef RW_OPENGL
+	// Need the float depth texture
+	if(!depthFloatTex || !depthFloatFbo)
+		return;
+#endif
+
+	// Check if camera has a valid z-buffer
+	RwRaster *zRaster = RwCameraGetZRaster(cam);
+	if(!zRaster)
+		return;
+
+#ifdef RW_OPENGL
+	using namespace rw::gl3;
+
+	// SSAO requires sampling depth texture, which is not possible on GLES (uses RBO)
+	if(gl3Caps.gles)
+		return;
+
+	PUSH_RENDERGROUP("CPostFX::RenderSSAO");
+
+	uint32 screenWidth = RwRasterGetWidth(RwCameraGetRaster(cam));
+	uint32 screenHeight = RwRasterGetHeight(RwCameraGetRaster(cam));
+	float recipCamZ = 1.0f / RwCameraGetNearClipPlane(cam);
+	float nearPlane = RwCameraGetNearClipPlane(cam);
+	float farPlane = RwCameraGetFarClipPlane(cam);
+
+	// Setup depth copy vertices covering only the screen-sized area.
+	// This matches the placement of glCopyTexSubImage2D used by GetBackBuffer
+	// (via rasterRenderFast), which places scene data at a y-offset in the
+	// power-of-2 texture. By using screen dimensions here, the depth occupies
+	// the same region as the scene in pBackBuffer.
+	float zero = -HALFPX;
+	float depthXmax = screenWidth - HALFPX;
+	float depthYmax = screenHeight - HALFPX;
+
+	RwIm2DVertexSetScreenX(&DepthCopyVertex[0], zero);
+	RwIm2DVertexSetScreenY(&DepthCopyVertex[0], zero);
+	RwIm2DVertexSetScreenZ(&DepthCopyVertex[0], RwIm2DGetNearScreenZ());
+	RwIm2DVertexSetCameraZ(&DepthCopyVertex[0], RwCameraGetNearClipPlane(cam));
+	RwIm2DVertexSetRecipCameraZ(&DepthCopyVertex[0], recipCamZ);
+	RwIm2DVertexSetU(&DepthCopyVertex[0], 0.0f, recipCamZ);
+	RwIm2DVertexSetV(&DepthCopyVertex[0], 0.0f, recipCamZ);
+	RwIm2DVertexSetIntRGBA(&DepthCopyVertex[0], 255, 255, 255, 255);
+
+	RwIm2DVertexSetScreenX(&DepthCopyVertex[1], zero);
+	RwIm2DVertexSetScreenY(&DepthCopyVertex[1], depthYmax);
+	RwIm2DVertexSetScreenZ(&DepthCopyVertex[1], RwIm2DGetNearScreenZ());
+	RwIm2DVertexSetCameraZ(&DepthCopyVertex[1], RwCameraGetNearClipPlane(cam));
+	RwIm2DVertexSetRecipCameraZ(&DepthCopyVertex[1], recipCamZ);
+	RwIm2DVertexSetU(&DepthCopyVertex[1], 0.0f, recipCamZ);
+	RwIm2DVertexSetV(&DepthCopyVertex[1], 1.0f, recipCamZ);
+	RwIm2DVertexSetIntRGBA(&DepthCopyVertex[1], 255, 255, 255, 255);
+
+	RwIm2DVertexSetScreenX(&DepthCopyVertex[2], depthXmax);
+	RwIm2DVertexSetScreenY(&DepthCopyVertex[2], depthYmax);
+	RwIm2DVertexSetScreenZ(&DepthCopyVertex[2], RwIm2DGetNearScreenZ());
+	RwIm2DVertexSetCameraZ(&DepthCopyVertex[2], RwCameraGetNearClipPlane(cam));
+	RwIm2DVertexSetRecipCameraZ(&DepthCopyVertex[2], recipCamZ);
+	RwIm2DVertexSetU(&DepthCopyVertex[2], 1.0f, recipCamZ);
+	RwIm2DVertexSetV(&DepthCopyVertex[2], 1.0f, recipCamZ);
+	RwIm2DVertexSetIntRGBA(&DepthCopyVertex[2], 255, 255, 255, 255);
+
+	RwIm2DVertexSetScreenX(&DepthCopyVertex[3], depthXmax);
+	RwIm2DVertexSetScreenY(&DepthCopyVertex[3], zero);
+	RwIm2DVertexSetScreenZ(&DepthCopyVertex[3], RwIm2DGetNearScreenZ());
+	RwIm2DVertexSetCameraZ(&DepthCopyVertex[3], RwCameraGetNearClipPlane(cam));
+	RwIm2DVertexSetRecipCameraZ(&DepthCopyVertex[3], recipCamZ);
+	RwIm2DVertexSetU(&DepthCopyVertex[3], 1.0f, recipCamZ);
+	RwIm2DVertexSetV(&DepthCopyVertex[3], 0.0f, recipCamZ);
+	RwIm2DVertexSetIntRGBA(&DepthCopyVertex[3], 255, 255, 255, 255);
+
+	// Get FBO handles
+	Gl3Raster *camNatRas = GETGL3RASTEREXT(RwCameraGetRaster(cam));
+	// Use parent raster for z-buffer (same as librw does internally)
+	RwRaster *zBufParent = zRaster->parent;
+	Gl3Raster *zNatRas = GETGL3RASTEREXT(zBufParent);
+
+	// Verify depth texture is valid
+	assert(zNatRas->texid != 0 && "Depth buffer texture ID is invalid");
+
+	rw::Raster *origFrameBuffer = cam->frameBuffer;
+
+	// ==========================================
+	// Pass 0: Copy depth buffer to float texture (high precision)
+	// ==========================================
+
+	// When the camera uses the default framebuffer (fbo=0), the z-buffer texture
+	// created by librw is allocated but never filled - the window system manages
+	// the actual depth buffer. We need to blit the real depth data into the texture.
+	if(camNatRas->fbo == 0) {
+		static GLuint depthBlitFbo = 0;
+		if(!depthBlitFbo)
+			glGenFramebuffers(1, &depthBlitFbo);
+
+		// Attach z-buffer texture as depth/stencil target on temp FBO
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, depthBlitFbo);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+			GL_TEXTURE_2D, zNatRas->texid, 0);
+
+		// Blit depth from default framebuffer to the z-buffer texture
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+		glBlitFramebuffer(0, 0, screenWidth, screenHeight,
+			0, 0, screenWidth, screenHeight,
+			GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+
+		// Detach so the texture can be sampled freely
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+			GL_TEXTURE_2D, 0, 0);
+	}
+
+	// Render depth to our custom R32F float texture for high precision
+	glBindFramebuffer(GL_FRAMEBUFFER, depthFloatFbo);
+	glViewport(0, 0, depthFloatWidth, depthFloatHeight);
+
+	// Clear to 1.0 (far plane) so unused areas don't cause artifacts
+	glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	// Disable depth test/write
+	glDisable(GL_DEPTH_TEST);
+	glDepthMask(GL_FALSE);
+
+	// Use depthCopy shader
+	depthCopy->use();
+
+	// Set up the xform uniform manually (same as im2DSetXform)
+	GLfloat xform[4];
+	xform[0] = 2.0f / depthFloatWidth;
+	xform[1] = -2.0f / depthFloatHeight;
+	xform[2] = -1.0f;
+	xform[3] = 1.0f;
+	glUniform4fv(depthCopy->uniformLocations[u_xform], 1, xform);
+
+	// Bind the depth texture to texture unit 0
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, zNatRas->texid);
+	// Set texture parameters for sampling depth (not shadow comparison)
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+	// Upload vertex data to im2D buffers and draw
+	glBindBuffer(GL_ARRAY_BUFFER, im2DVbo);
+	glBufferSubData(GL_ARRAY_BUFFER, 0, 4*sizeof(RwIm2DVertex), DepthCopyVertex);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, im2DIbo);
+	glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, 6*sizeof(RwImVertexIndex), Index);
+
+	// Set up vertex attributes manually
+	// ATTRIB_POS = 0, ATTRIB_COLOR = 2, ATTRIB_TEXCOORDS0 = 5
+	glEnableVertexAttribArray(0); // position
+	glEnableVertexAttribArray(2); // color
+	glEnableVertexAttribArray(5); // texcoord
+	glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(RwIm2DVertex), (void*)0);
+	glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(RwIm2DVertex), (void*)16);
+	glVertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, sizeof(RwIm2DVertex), (void*)20);
+
+	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nil);
+
+	// Disable vertex attributes we enabled manually
+	glDisableVertexAttribArray(0);
+	glDisableVertexAttribArray(2);
+	glDisableVertexAttribArray(5);
+
+	// Restore depth state to librw's expected values
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+
+	// Get FBO handles for librw rasters
+	Gl3Raster *ssaoNatRas = GETGL3RASTEREXT(pSSAOBuffer);
+	Gl3Raster *ssaoBlurNatRas = GETGL3RASTEREXT(pSSAOBlurBuffer);
+
+	uint32 ssaoWidth = RwRasterGetWidth(pSSAOBuffer);
+	uint32 ssaoHeight = RwRasterGetHeight(pSSAOBuffer);
+	float texelSizeX = 1.0f / ssaoWidth;
+	float texelSizeY = 1.0f / ssaoHeight;
+
+	// Setup SSAO vertices for SSAO buffer size
+	float ssaoZero = -HALFPX;
+	float ssaoXmax = ssaoWidth - HALFPX;
+	float ssaoYmax = ssaoHeight - HALFPX;
+
+	RwIm2DVertexSetScreenX(&SSAOVertex[0], ssaoZero);
+	RwIm2DVertexSetScreenY(&SSAOVertex[0], ssaoZero);
+	RwIm2DVertexSetScreenZ(&SSAOVertex[0], RwIm2DGetNearScreenZ());
+	RwIm2DVertexSetCameraZ(&SSAOVertex[0], RwCameraGetNearClipPlane(cam));
+	RwIm2DVertexSetRecipCameraZ(&SSAOVertex[0], recipCamZ);
+	RwIm2DVertexSetU(&SSAOVertex[0], 0.0f, recipCamZ);
+	RwIm2DVertexSetV(&SSAOVertex[0], 0.0f, recipCamZ);
+	RwIm2DVertexSetIntRGBA(&SSAOVertex[0], 255, 255, 255, 255);
+
+	RwIm2DVertexSetScreenX(&SSAOVertex[1], ssaoZero);
+	RwIm2DVertexSetScreenY(&SSAOVertex[1], ssaoYmax);
+	RwIm2DVertexSetScreenZ(&SSAOVertex[1], RwIm2DGetNearScreenZ());
+	RwIm2DVertexSetCameraZ(&SSAOVertex[1], RwCameraGetNearClipPlane(cam));
+	RwIm2DVertexSetRecipCameraZ(&SSAOVertex[1], recipCamZ);
+	RwIm2DVertexSetU(&SSAOVertex[1], 0.0f, recipCamZ);
+	RwIm2DVertexSetV(&SSAOVertex[1], 1.0f, recipCamZ);
+	RwIm2DVertexSetIntRGBA(&SSAOVertex[1], 255, 255, 255, 255);
+
+	RwIm2DVertexSetScreenX(&SSAOVertex[2], ssaoXmax);
+	RwIm2DVertexSetScreenY(&SSAOVertex[2], ssaoYmax);
+	RwIm2DVertexSetScreenZ(&SSAOVertex[2], RwIm2DGetNearScreenZ());
+	RwIm2DVertexSetCameraZ(&SSAOVertex[2], RwCameraGetNearClipPlane(cam));
+	RwIm2DVertexSetRecipCameraZ(&SSAOVertex[2], recipCamZ);
+	RwIm2DVertexSetU(&SSAOVertex[2], 1.0f, recipCamZ);
+	RwIm2DVertexSetV(&SSAOVertex[2], 1.0f, recipCamZ);
+	RwIm2DVertexSetIntRGBA(&SSAOVertex[2], 255, 255, 255, 255);
+
+	RwIm2DVertexSetScreenX(&SSAOVertex[3], ssaoXmax);
+	RwIm2DVertexSetScreenY(&SSAOVertex[3], ssaoZero);
+	RwIm2DVertexSetScreenZ(&SSAOVertex[3], RwIm2DGetNearScreenZ());
+	RwIm2DVertexSetCameraZ(&SSAOVertex[3], RwCameraGetNearClipPlane(cam));
+	RwIm2DVertexSetRecipCameraZ(&SSAOVertex[3], recipCamZ);
+	RwIm2DVertexSetU(&SSAOVertex[3], 1.0f, recipCamZ);
+	RwIm2DVertexSetV(&SSAOVertex[3], 0.0f, recipCamZ);
+	RwIm2DVertexSetIntRGBA(&SSAOVertex[3], 255, 255, 255, 255);
+
+	// ==========================================
+	// Pass 1: Calculate SSAO using the float depth texture
+	// ==========================================
+	bindFramebuffer(ssaoNatRas->fbo);
+	glViewport(0, 0, ssaoWidth, ssaoHeight);
+	cam->frameBuffer = pSSAOBuffer;
+
+	// Use the float depth texture directly via GL calls
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, depthFloatTex);
+
+	im2dOverrideShader = ssaoCalc;
+	ssaoCalc->use();
+	
+	// Set uniforms
+	glUniform2f(ssaoCalc->uniformLocations[u_texelSize], texelSizeX, texelSizeY);
+	glUniform1f(ssaoCalc->uniformLocations[u_ssaoRadius], SSAORadius);
+	glUniform1f(ssaoCalc->uniformLocations[u_ssaoBias], SSAOBias);
+	glUniform1f(ssaoCalc->uniformLocations[u_ssaoIntensity], SSAOIntensity);
+	glUniform1f(ssaoCalc->uniformLocations[u_nearPlane], nearPlane);
+	glUniform1f(ssaoCalc->uniformLocations[u_farPlane], farPlane);
+
+	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, SSAOVertex, 4, Index, 6);
+	
+	im2dOverrideShader = nil;
+
+	// ==========================================
+	// Pass 2: Blur SSAO
+	// ==========================================
+	bindFramebuffer(ssaoBlurNatRas->fbo);
+
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, pSSAOBuffer);
+	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
+
+	im2dOverrideShader = ssaoBlur;
+	ssaoBlur->use();
+	glUniform2f(ssaoBlur->uniformLocations[u_texelSize], texelSizeX, texelSizeY);
+
+	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, SSAOVertex, 4, Index, 6);
+
+	// Restore original camera frameBuffer
+	cam->frameBuffer = origFrameBuffer;
+
+	// Restore original framebuffer and viewport
+	bindFramebuffer(camNatRas->fbo);
+	glViewport(0, 0, screenWidth, screenHeight);
+
+	// ==========================================
+	// Pass 3: Apply SSAO to scene
+	// ==========================================
+	RwTextureSetRaster(pSSAOTex, pSSAOBlurBuffer);
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, pBackBuffer);
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+
+	rw::gl3::setTexture(1, pSSAOTex);
+	im2dOverrideShader = ssaoApply;
+	ssaoApply->use();
+
+	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, Vertex, 4, Index, 6);
+
+	rw::gl3::setTexture(1, nil);
+	im2dOverrideShader = nil;
+#endif
+
+	POP_RENDERGROUP();
+}
+
 bool
 CPostFX::NeedBackBuffer(void)
 {
 	// Bloom always needs back buffer
 	if(BloomEnable)
+		return true;
+	// SSAO always needs back buffer
+	if(SSAOEnable)
 		return true;
 
 	// Current frame -- needed for non-blur effect
@@ -659,6 +1124,13 @@ CPostFX::Render(RwCamera *cam, uint32 red, uint32 green, uint32 blue, uint32 blu
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
 	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+
+	// Render SSAO effect (before bloom so darkened areas can be bloomed)
+	RenderSSAO(cam);
+
+	// Need to re-capture back buffer after SSAO has been applied
+	if(SSAOEnable && BloomEnable)
+		GetBackBuffer(cam);
 
 	// Render bloom effect
 	RenderBloom(cam);

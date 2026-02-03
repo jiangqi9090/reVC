@@ -1064,6 +1064,13 @@ extern bool gbRenderWorld2;
 		DebugMenuAddVar("Render", "Intensity", &CPostFX::Intensity, nil, 0.05f, 0, 10.0f);
 		DebugMenuAddVarBool8("Render", "Blur", &CPostFX::BlurOn, nil);
 		DebugMenuAddVarBool8("Render", "Motion Blur", &CPostFX::MotionBlurOn, nil);
+		DebugMenuAddVarBool8("Render", "Bloom Enable", &CPostFX::BloomEnable, nil);
+		DebugMenuAddVar("Render", "Bloom Threshold", &CPostFX::BloomThreshold, nil, 0.05f, 0.0f, 2.0f);
+		DebugMenuAddVar("Render", "Bloom Intensity", &CPostFX::BloomIntensity, nil, 0.1f, 0.0f, 10.0f);
+		DebugMenuAddVarBool8("Render", "SSAO Enable", &CPostFX::SSAOEnable, nil);
+		DebugMenuAddVar("Render", "SSAO Radius", &CPostFX::SSAORadius, nil, 0.05f, 0.1f, 5.0f);
+		DebugMenuAddVar("Render", "SSAO Bias", &CPostFX::SSAOBias, nil, 0.005f, 0.0f, 0.2f);
+		DebugMenuAddVar("Render", "SSAO Intensity", &CPostFX::SSAOIntensity, nil, 0.1f, 0.0f, 5.0f);
 #endif
 		DebugMenuAddVar("Render", "Drunkness", &CMBlur::Drunkness, nil, 0.05f, 0, 1.0f);
 #ifndef MASTER
